@@ -1,0 +1,6 @@
+# Saved logins contain OAuth tokens. They live in ~/.claude/accounts, never here.
+accounts/
+*.credentials.json
+.claude.json
+*.tmp
+node_modules/
