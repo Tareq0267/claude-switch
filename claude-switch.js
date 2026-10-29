@@ -14,13 +14,18 @@ const STATE_FILE = process.env.CLAUDE_CONFIG_DIR
 const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 const PROFILES_DIR = path.join(CONFIG_DIR, 'accounts');
 const BACKUP_DIR = path.join(PROFILES_DIR, '.backup');
-const LIMITS_FILE = path.join(PROFILES_DIR, '.limits.json');
+const AUTO_STATE_FILE = path.join(PROFILES_DIR, '.auto-state.json');
 const AUTO_LOG = path.join(PROFILES_DIR, 'auto.log');
 
-// Claude Code's usage limit resets within 5 hours, so an account that hit it
-// more recently than this is skipped by auto-switch.
-const LIMIT_COOLDOWN_MS = 5 * 60 * 60 * 1000;
-const HOOK_COMMAND = `node "${__filename.replace(/\\/g, '/')}" --hook`;
+// The same endpoint Claude Code uses for its usage panel.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_WINDOWS = { five_hour: '5-hour', seven_day: 'weekly' };
+const DEFAULT_THRESHOLD = 95;
+// Usage is checked after each turn, but at most this often until it gets within 10% of the threshold.
+const CHECK_INTERVAL_MS = 2 * 60 * 1000;
+// Used when an account hit its limit but the reset time is unknown.
+const FALLBACK_LIMIT_MS = 5 * 60 * 60 * 1000;
+const SCRIPT_PATH = __filename.replace(/\\/g, '/');
 
 // Account-specific caches in .claude.json, swapped along with the login so
 // usage limits and model lists from one account don't show up in the other.
@@ -36,9 +41,9 @@ const HELP = `claude-switch - swap Claude Code between saved claude.ai accounts
   claude-switch <email>         switch to a specific account (partial match ok)
   claude-switch save            save the currently logged-in account
   claude-switch list            list saved accounts (* = active)
-  claude-switch --auto [on]     switch automatically when an account hits its usage limit
+  claude-switch --auto [N]      auto-switch when usage reaches N% (default ${DEFAULT_THRESHOLD})
   claude-switch --auto off      turn auto-switch off
-  claude-switch --auto status   show whether auto-switch is on
+  claude-switch --auto status   show auto-switch settings and current usage
   claude-switch help            show this help
 
 After switching, start a new Claude session (or type "continue").`;
@@ -174,49 +179,100 @@ function cmdSwitch(query) {
 }
 
 // --- auto-switch ------------------------------------------------------------
+//
+// Two hooks call `claude-switch --hook --at N`:
+//   Stop         after every turn: switch once 5-hour or weekly usage reaches N%
+//   StopFailure  when a turn fails on the usage limit: switch right away (backstop)
 
 const readJsonOr = (file, fallback) => (fs.existsSync(file) ? readJson(file) : fallback);
 
-function isOurHook(entry) {
-  return (entry.hooks || []).some((h) => typeof h.command === 'string' && h.command.includes('claude-switch') && h.command.includes('--hook'));
+const isOurHook = (entry) => (entry.hooks || []).some(
+  (h) => typeof h.command === 'string' && h.command.includes('claude-switch') && h.command.includes('--hook'),
+);
+
+function installedThreshold(settings) {
+  for (const event of ['Stop', 'StopFailure']) {
+    for (const entry of (settings.hooks && settings.hooks[event]) || []) {
+      if (!isOurHook(entry)) continue;
+      const match = entry.hooks.map((h) => h.command).join(' ').match(/--at (\d+)/);
+      return match ? Number(match[1]) : DEFAULT_THRESHOLD;
+    }
+  }
+  return null;
 }
 
-// Removes any existing claude-switch hook, so re-running "on" never duplicates it.
-function withoutOurHook(settings) {
-  const entries = (settings.hooks && settings.hooks.StopFailure) || [];
-  const kept = entries.filter((entry) => !isOurHook(entry));
-  if (kept.length) settings.hooks.StopFailure = kept;
-  else if (settings.hooks) delete settings.hooks.StopFailure;
-  if (settings.hooks && !Object.keys(settings.hooks).length) delete settings.hooks;
-  return settings;
+// Removes our hooks only, so re-running never duplicates them and other hooks survive.
+function removeOurHooks(settings) {
+  if (!settings.hooks) return;
+  for (const event of ['Stop', 'StopFailure']) {
+    const kept = (settings.hooks[event] || []).filter((entry) => !isOurHook(entry));
+    if (kept.length) settings.hooks[event] = kept;
+    else delete settings.hooks[event];
+  }
+  if (!Object.keys(settings.hooks).length) delete settings.hooks;
 }
 
-function cmdAuto(mode = 'on') {
+async function fetchUsage(accessToken) {
+  const res = await fetch(USAGE_URL, {
+    headers: { Authorization: `Bearer ${accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(`usage request failed (HTTP ${res.status})`);
+  return res.json();
+}
+
+// The most-used window, plus when the account frees up again if it is at or over the threshold.
+function summarizeUsage(usage, threshold) {
+  let worst = { pct: 0, name: USAGE_WINDOWS.five_hour };
+  let freeAt = 0;
+  for (const [key, name] of Object.entries(USAGE_WINDOWS)) {
+    const window = usage[key];
+    if (!window || typeof window.utilization !== 'number') continue;
+    if (window.utilization > worst.pct) worst = { pct: window.utilization, name };
+    if (window.utilization >= threshold) {
+      freeAt = Math.max(freeAt, Date.parse(window.resets_at) || Date.now() + FALLBACK_LIMIT_MS);
+    }
+  }
+  return { ...worst, freeAt };
+}
+
+async function cmdAuto(arg) {
   const settings = readJsonOr(SETTINGS_FILE, {});
-  const enabled = ((settings.hooks && settings.hooks.StopFailure) || []).some(isOurHook);
+  const installed = installedThreshold(settings);
 
-  if (mode === 'status') {
-    console.log(`Auto-switch is ${enabled ? 'on' : 'off'}.`);
+  if (arg === 'status') {
+    console.log(installed === null ? 'Auto-switch is off.' : `Auto-switch is on: switches at ${installed}% usage.`);
+    try {
+      const account = currentAccount();
+      const { pct, name } = summarizeUsage(await fetchUsage(account.claudeAiOauth.accessToken), 100);
+      console.log(`${account.email} is at ${pct}% of its ${name} limit.`);
+    } catch (err) {
+      console.log(`Couldn't read current usage: ${err.message}`);
+    }
     if (fs.existsSync(AUTO_LOG)) console.log(`Log: ${AUTO_LOG}`);
     return;
   }
-  if (mode !== 'on' && mode !== 'off') throw new UserError('Usage: claude-switch --auto [on|off|status]');
 
-  withoutOurHook(settings);
-  if (mode === 'on') {
-    settings.hooks = settings.hooks || {};
-    settings.hooks.StopFailure = settings.hooks.StopFailure || [];
-    settings.hooks.StopFailure.push({
-      matcher: 'rate_limit',
-      hooks: [{ type: 'command', command: HOOK_COMMAND, timeout: 30 }],
-    });
+  removeOurHooks(settings);
+  if (arg === 'off') {
+    writeJson(SETTINGS_FILE, settings);
+    console.log('Auto-switch is off.');
+    return;
   }
+
+  const threshold = arg === undefined || arg === 'on' ? DEFAULT_THRESHOLD : Number(String(arg).replace(/%$/, ''));
+  if (!Number.isInteger(threshold) || threshold < 1 || threshold > 100) {
+    throw new UserError('Usage: claude-switch --auto [1-100|off|status]');
+  }
+  const hook = { type: 'command', command: `node "${SCRIPT_PATH}" --hook --at ${threshold}`, timeout: 30 };
+  settings.hooks = settings.hooks || {};
+  settings.hooks.Stop = [...(settings.hooks.Stop || []), { hooks: [hook] }];
+  settings.hooks.StopFailure = [...(settings.hooks.StopFailure || []), { matcher: 'rate_limit', hooks: [hook] }];
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
   writeJson(SETTINGS_FILE, settings);
 
-  if (mode === 'off') return console.log('Auto-switch is off.');
-  console.log('Auto-switch is on. When an account hits its usage limit, the next one is switched in;');
-  console.log('type "continue" (or start a new session) to carry on.');
+  console.log(`Auto-switch is on: switches to the next account when usage reaches ${threshold}%`);
+  console.log('(or right away if a turn hits the limit first).');
   if (savedProfiles().length < 2) console.log('Note: save at least 2 accounts first (claude-switch save).');
 }
 
@@ -225,60 +281,102 @@ function logAuto(message) {
   fs.appendFileSync(AUTO_LOG, `${new Date().toISOString()} ${message}\n`);
 }
 
-// Called by Claude Code's StopFailure hook, with the hook event as JSON on stdin.
-function cmdHook() {
+function readAutoState() {
+  return { exhausted: {}, lastCheck: 0, lastPct: 0, ...readJsonOr(AUTO_STATE_FILE, {}) };
+}
+
+// Called by Claude Code's hooks, with the hook event as JSON on stdin.
+async function cmdHook(args) {
+  const atIndex = args.indexOf('--at');
+  const threshold = atIndex >= 0 ? Number(args[atIndex + 1]) : DEFAULT_THRESHOLD;
   let event = {};
   try {
     event = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
   } catch {
-    // No or bad input: fall through and treat it as a usage-limit event, since the matcher already filtered.
+    // Unreadable input: treat it as a plain end-of-turn check.
   }
-  if (event.error && event.error !== 'rate_limit') return;
+  const hitLimit = event.hook_event_name === 'StopFailure';
+  if (hitLimit && event.error !== 'rate_limit') return;
 
   const profiles = savedProfiles();
-  if (profiles.length < 2) return logAuto('limit hit, but fewer than 2 accounts are saved');
+  if (profiles.length < 2) return;
+  const current = currentAccount();
+  const state = readAutoState();
+  const now = Date.now();
 
-  const current = syncCurrentProfile(profiles);
-  const limits = readJsonOr(LIMITS_FILE, {});
-  limits[current.accountUuid] = Date.now();
-  writeJson(LIMITS_FILE, limits);
+  let reason;
+  let freeAt;
+  if (hitLimit) {
+    reason = 'hit its usage limit';
+    freeAt = now + FALLBACK_LIMIT_MS;
+    try {
+      freeAt = summarizeUsage(await fetchUsage(current.claudeAiOauth.accessToken), 100).freeAt || freeAt;
+    } catch {
+      // Keep the fallback reset time.
+    }
+  } else {
+    const nearThreshold = state.lastPct >= threshold - 10;
+    if (!nearThreshold && now - state.lastCheck < CHECK_INTERVAL_MS) return;
+    state.lastCheck = now;
+    let usage;
+    try {
+      usage = summarizeUsage(await fetchUsage(current.claudeAiOauth.accessToken), threshold);
+    } catch (err) {
+      writeJson(AUTO_STATE_FILE, state);
+      logAuto(`usage check skipped: ${err.message}`);
+      return;
+    }
+    state.lastPct = usage.pct;
+    if (usage.pct < threshold) {
+      writeJson(AUTO_STATE_FILE, state);
+      return;
+    }
+    reason = `is at ${usage.pct}% of its ${usage.name} limit`;
+    freeAt = usage.freeAt;
+  }
+  state.exhausted[current.accountUuid] = freeAt;
 
-  // Try the other accounts in order, starting after the current one, skipping recently limited ones.
+  // Next account in order after the current one that isn't used up or expired.
   const start = profiles.findIndex((p) => p.accountUuid === current.accountUuid);
   const target = profiles
     .map((_, i) => profiles[(start + 1 + i) % profiles.length])
     .find((p) => p.accountUuid !== current.accountUuid
-      && Date.now() - (limits[p.accountUuid] || 0) >= LIMIT_COOLDOWN_MS
-      && (p.claudeAiOauth.refreshTokenExpiresAt || Infinity) > Date.now());
+      && (state.exhausted[p.accountUuid] || 0) <= now
+      && (p.claudeAiOauth.refreshTokenExpiresAt || Infinity) > now);
 
   let message;
   if (target) {
+    syncCurrentProfile(profiles);
     activate(target);
-    message = `claude-switch: ${current.email} hit its usage limit. Switched to ${target.email}. Type "continue" to carry on.`;
-  } else {
-    message = `claude-switch: ${current.email} hit its usage limit, and every other saved account hit its limit in the last 5 hours.`;
+    Object.assign(state, { lastCheck: 0, lastPct: 0, quietUntil: 0 });
+    message = `${current.email} ${reason}. Switched to ${target.email}.`;
+    if (hitLimit) message += ' Type "continue" to carry on.';
+  } else if ((state.quietUntil || 0) <= now) {
+    // Say this once per limit period, not after every turn.
+    state.quietUntil = freeAt;
+    message = `${current.email} ${reason}, and no other saved account has usage left right now.`;
   }
-  logAuto(message.replace('claude-switch: ', ''));
-  console.log(JSON.stringify({ systemMessage: message }));
+  writeJson(AUTO_STATE_FILE, state);
+  if (!message) return;
+  logAuto(message);
+  console.log(JSON.stringify({ systemMessage: `claude-switch: ${message}` }));
 }
 
 // ----------------------------------------------------------------------------
 
-function main(args) {
+async function main(args) {
   const [command, arg] = args;
   if (command === 'help' || command === '-h' || command === '--help') return console.log(HELP);
   if (command === 'save') return cmdSave();
   if (command === 'list') return cmdList();
   if (command === '--auto' || command === 'auto') return cmdAuto(arg);
-  if (command === '--hook') return cmdHook();
+  if (command === '--hook') return cmdHook(args.slice(1));
   return cmdSwitch(command);
 }
 
-try {
-  main(process.argv.slice(2));
-} catch (err) {
+main(process.argv.slice(2)).catch((err) => {
   const message = err instanceof UserError ? err.message : err.stack;
   if (process.argv[2] === '--hook') logAuto(`error: ${message}`);
   console.error(`claude-switch: ${message}`);
   process.exit(1);
-}
+});

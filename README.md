@@ -41,16 +41,23 @@ After switching, start a new Claude session. You don't need to reload VS Code.
 ## Auto-switch
 
 ```bash
-cs --auto           # turn on: switch automatically when an account hits its usage limit
-cs --auto status    # check whether it's on
+cs --auto           # turn on: switch when usage reaches 95%
+cs --auto 90        # turn on with your own threshold (1-100)
+cs --auto status    # show the threshold and the current account's usage
 cs --auto off       # turn it off
 ```
 
-When Claude stops because the account hit its usage limit, the next saved account is switched in and Claude shows a message. Type `continue` (or start a new session) to pick up where you left off. The reply that hit the limit still fails; auto-switch only saves you the manual switch.
+After each Claude reply, auto-switch checks the current account's usage. When its 5-hour or weekly usage reaches the threshold, the next saved account is switched in and Claude shows a message, so you switch before ever hitting the wall.
 
-Accounts that hit their limit in the last 5 hours are skipped. If all of them have, nothing is switched. Every auto-switch is logged in `~/.claude/accounts/auto.log`.
+If a reply hits the limit before the threshold is reached, auto-switch switches right away instead. That reply still fails; type `continue` (or start a new session) to carry on.
 
-It works by adding a `StopFailure` hook (matcher `rate_limit`) to `~/.claude/settings.json`. Your other settings and hooks are left alone, and `cs --auto off` removes only this hook. If you move the repo folder, run `cs --auto` again so the hook points to the new location.
+Notes:
+
+- Usage is checked at most every 2 minutes, and after every reply once it's within 10% of the threshold. Each check is a single small request to the same usage endpoint Claude Code's own usage panel uses.
+- An account that's used up is skipped until its limit resets. If every account is used up, nothing is switched and you're told once.
+- Every auto-switch is logged in `~/.claude/accounts/auto.log`.
+- It works by adding a `Stop` hook and a `StopFailure` hook to `~/.claude/settings.json`. Your other settings and hooks are left alone, and `cs --auto off` removes only these. If you move the repo folder, run `cs --auto` again so the hooks point to the new location.
+- The usage endpoint isn't a public API, so a Claude Code update could change it. If it does, the percentage check quietly stops (the log says why), and switching when you actually hit the limit still works.
 
 ## How it works
 
