@@ -38,6 +38,20 @@ cs save             # save or update the current login
 
 After switching, start a new Claude session. You don't need to reload VS Code.
 
+## Auto-switch
+
+```bash
+cs --auto           # turn on: switch automatically when an account hits its usage limit
+cs --auto status    # check whether it's on
+cs --auto off       # turn it off
+```
+
+When Claude stops because the account hit its usage limit, the next saved account is switched in and Claude shows a message. Type `continue` (or start a new session) to pick up where you left off. The reply that hit the limit still fails; auto-switch only saves you the manual switch.
+
+Accounts that hit their limit in the last 5 hours are skipped. If all of them have, nothing is switched. Every auto-switch is logged in `~/.claude/accounts/auto.log`.
+
+It works by adding a `StopFailure` hook (matcher `rate_limit`) to `~/.claude/settings.json`. Your other settings and hooks are left alone, and `cs --auto off` removes only this hook. If you move the repo folder, run `cs --auto` again so the hook points to the new location.
+
 ## How it works
 
 Claude Code keeps the login in two files:
